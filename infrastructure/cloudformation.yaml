@@ -1,0 +1,329 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Amplify Form Builder services'
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    Description: Environment stage (dev, test, prod)
+    AllowedValues:
+      - dev
+      - test
+      - prod
+
+Resources:
+  # DynamoDB Tables
+  FormsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub FormBuilder-Forms-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: formId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: formId
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: AmplifyFormBuilder
+
+  ResponsesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub FormBuilder-Responses-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: responseId
+          AttributeType: S
+        - AttributeName: formId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: responseId
+          KeyType: HASH
+        - AttributeName: formId
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: AmplifyFormBuilder
+
+  # IAM Roles
+  FormBuilderLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: FormBuilderDynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource: 
+                  - !GetAtt FormsTable.Arn
+                  - !GetAtt ResponsesTable.Arn
+
+  # Lambda Functions
+  CreateFormFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub FormBuilder-CreateForm-${Stage}
+      Handler: index.handler
+      Role: !GetAtt FormBuilderLambdaRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          FORMS_TABLE: !Ref FormsTable
+          AMPLIFY_APP_URL: !Sub 'https://${AmplifyApp}.amplifyapp.com'
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const { v4: uuidv4 } = require('uuid');
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event) => {
+            try {
+              const data = JSON.parse(event.body);
+              const { title, description, jsonSchema, uiSchema = {} } = data;
+              
+              // Validate inputs
+              if (!title || !jsonSchema) {
+                return {
+                  statusCode: 400,
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ error: 'Missing required fields: title, jsonSchema' })
+                };
+              }
+              
+              // Generate a unique ID for the form
+              const formId = uuidv4();
+              const timestamp = new Date().toISOString();
+              
+              // Create the form record
+              const formItem = {
+                formId,
+                title,
+                description: description || '',
+                jsonSchema,
+                uiSchema,
+                createdAt: timestamp,
+                updatedAt: timestamp,
+                status: 'ACTIVE'
+              };
+              
+              // Add the form to DynamoDB
+              await dynamoDB.put({
+                TableName: process.env.FORMS_TABLE,
+                Item: formItem
+              }).promise();
+              
+              // Generate the form URL
+              const formUrl = `${process.env.AMPLIFY_APP_URL}/forms/${formId}`;
+              
+              // Return success response
+              return {
+                statusCode: 201,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  message: 'Form created successfully',
+                  formId,
+                  formUrl
+                })
+              };
+            } catch (error) {
+              console.error('Error creating form:', error);
+              
+              return {
+                statusCode: 500,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  error: 'Internal server error',
+                  message: error.message
+                })
+              };
+            }
+          };
+
+  GetFormFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub FormBuilder-GetForm-${Stage}
+      Handler: index.handler
+      Role: !GetAtt FormBuilderLambdaRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          FORMS_TABLE: !Ref FormsTable
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event) => {
+            try {
+              const formId = event.pathParameters.formId;
+              
+              // Validate inputs
+              if (!formId) {
+                return {
+                  statusCode: 400,
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ error: 'Missing required parameter: formId' })
+                };
+              }
+              
+              // Get the form from DynamoDB
+              const result = await dynamoDB.get({
+                TableName: process.env.FORMS_TABLE,
+                Key: { formId }
+              }).promise();
+              
+              // Check if the form exists
+              if (!result.Item) {
+                return {
+                  statusCode: 404,
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ error: 'Form not found' })
+                };
+              }
+              
+              // Return the form
+              return {
+                statusCode: 200,
+                headers: { 
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'GET'
+                },
+                body: JSON.stringify(result.Item)
+              };
+            } catch (error) {
+              console.error('Error retrieving form:', error);
+              
+              return {
+                statusCode: 500,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  error: 'Internal server error',
+                  message: error.message
+                })
+              };
+            }
+          };
+
+  # API Gateway
+  FormBuilderApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub FormBuilder-API-${Stage}
+      Description: API for Form Builder service
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Resources and Methods
+  FormsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref FormBuilderApi
+      ParentId: !GetAtt FormBuilderApi.RootResourceId
+      PathPart: 'forms'
+
+  CreateFormMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref FormBuilderApi
+      ResourceId: !Ref FormsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateFormFunction.Arn}/invocations
+
+  FormResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref FormBuilderApi
+      ParentId: !Ref FormsResource
+      PathPart: '{formId}'
+
+  GetFormMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref FormBuilderApi
+      ResourceId: !Ref FormResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetFormFunction.Arn}/invocations
+
+  # Lambda Permissions
+  CreateFormPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CreateFormFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${FormBuilderApi}/*/POST/forms
+
+  GetFormPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GetFormFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${FormBuilderApi}/*/GET/forms/{formId}
+
+  # API Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CreateFormMethod
+      - GetFormMethod
+    Properties:
+      RestApiId: !Ref FormBuilderApi
+      StageName: !Ref Stage
+
+  # Amplify App (Placeholder - requires manual configuration in Amplify Console)
+  AmplifyApp:
+    Type: String
+    Default: placeholder-app-id
+    Description: Placeholder for the Amplify App ID (configure manually in Amplify Console)
+
+Outputs:
+  ApiEndpoint:
+    Description: URL of the API Gateway endpoint
+    Value: !Sub https://${FormBuilderApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  
+  CreateFormEndpoint:
+    Description: Endpoint for creating forms
+    Value: !Sub https://${FormBuilderApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/forms
+  
+  FormsTableName:
+    Description: Name of the DynamoDB table for storing forms
+    Value: !Ref FormsTable
+  
+  ResponsesTableName:
+    Description: Name of the DynamoDB table for storing form responses
+    Value: !Ref ResponsesTable
